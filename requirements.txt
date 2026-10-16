@@ -1,5 +1,4 @@
-aiohttp==3.14.3
+aiohttp==3.14.5
+cryptography==50.0.2
 mss==10.2.0
 pillow==12.3.0
-pyobjc-framework-ApplicationServices==12.2.2
-pyobjc-framework-Quartz==12.2.2

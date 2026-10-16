@@ -3,5 +3,5 @@
   "port": 8765,
   "quality": 65,
   "max_width": 1920,
-  "resolution": [1920, 1080]
+  "resolution": null
 }

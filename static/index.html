@@ -21,8 +21,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:syste
 <div id="msg">Bağlanıyor…</div>
 <div id="bar">
   <span id="status">—</span>
-  <button id="fs" title="Tam ekranda Alt+Tab, Win tuşu vb. de Mac'e gider">⛶ Tam ekran</button>
-  <label title="Windows'taki Ctrl tuşu Mac'te ⌘ (Command) olarak gönderilir; Ctrl+C / Ctrl+V doğal çalışır"><input type="checkbox" id="ctrlcmd" checked> Ctrl→⌘</label>
+  <button id="fs" title="Tam ekranda Alt+Tab, Win tuşu vb. de uzak bilgisayara gider">⛶ Tam ekran</button>
   <select id="quality" title="Görüntü kalitesi">
     <option value="45,1280">Hızlı</option>
     <option value="65,1920" selected>Dengeli</option>
@@ -33,11 +32,11 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:syste
   <button onclick="location.href='/logout'">Çıkış</button>
 </div>
 <div id="clip">
-  <textarea id="cliptext" placeholder="Mac'e göndermek istediğiniz metni buraya yapıştırın (Ctrl+V)…"></textarea>
+  <textarea id="cliptext" placeholder="Uzak bilgisayara göndermek istediğiniz metni buraya yapıştırın (Ctrl+V)…"></textarea>
   <div>
-    <button id="toMac">Mac panosuna gönder</button>
-    <button id="typeMac">Mac'te yaz</button>
-    <button id="fromMac">Mac panosunu al</button>
+    <button id="toRemote">Uzak panoya gönder</button>
+    <button id="typeRemote">Uzakta yaz</button>
+    <button id="fromRemote">Uzak panoyu al</button>
     <button id="clipClose">Kapat</button>
   </div>
 </div>
@@ -45,13 +44,12 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:syste
 const cv = document.getElementById('screen'), ctx = cv.getContext('2d');
 const msg = document.getElementById('msg'), statusEl = document.getElementById('status');
 const clip = document.getElementById('clip'), clipText = document.getElementById('cliptext');
-const ctrlCmd = document.getElementById('ctrlcmd'), quality = document.getElementById('quality');
+const quality = document.getElementById('quality');
 let ws = null, frames = 0, retry = 500;
-const held = new Set();      // Mac'e basılı olarak gönderilmiş tuş kodları
+const held = new Set();      // uzak bilgisayara basılı olarak gönderilmiş tuş kodları
 const typed = new Set();     // karakter olarak yazılmış tuşlar (keyup gönderilmez)
 
-try { ctrlCmd.checked = localStorage.getItem('ctrlcmd') !== '0';
-      const q = localStorage.getItem('quality'); if (q && [...quality.options].some(o => o.value === q)) quality.value = q; } catch (e) {}
+try { const q = localStorage.getItem('quality'); if (q && [...quality.options].some(o => o.value === q)) quality.value = q; } catch (e) {}
 
 function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
 function sendCfg() {
@@ -105,14 +103,6 @@ cv.addEventListener('wheel', e => {
 }, {passive: false});
 
 // ---------- klavye
-function mapCode(code) {
-  if (ctrlCmd.checked) {
-    if (code === 'ControlLeft') return 'MetaLeft';
-    if (code === 'ControlRight') return 'MetaRight';
-    if (code === 'MetaLeft' || code === 'OSLeft') return 'ControlLeft';
-  }
-  return code;
-}
 function isPrintable(e) {
   if (e.key.length !== 1) return false;
   const altGr = e.getModifierState('AltGraph');
@@ -121,7 +111,7 @@ function isPrintable(e) {
 }
 function keyActive() { return document.activeElement === cv || document.fullscreenElement; }
 
-// Klavye olayları sırayla gider; Ctrl+V'de önce pano Mac'e aktarılır, sonra tuş gönderilir.
+// Klavye olayları sırayla gider; Ctrl+V'de önce pano uzak bilgisayara aktarılır, sonra tuş gönderilir.
 let keyQueue = Promise.resolve();
 function ksend(o) { keyQueue = keyQueue.then(() => send(o)); }
 
@@ -131,27 +121,26 @@ window.addEventListener('keydown', e => {
   if (e.key === 'Dead') return;
   if (isPrintable(e)) { typed.add(e.code); ksend({t: 'tx', s: e.key}); return; }
   if (e.code === 'KeyV' && (e.ctrlKey || e.metaKey) && !e.repeat) keyQueue = keyQueue.then(pushLocalClip);
-  const c = mapCode(e.code); held.add(c); ksend({t: 'kd', code: c});
+  held.add(e.code); ksend({t: 'kd', code: e.code});
 });
 window.addEventListener('keyup', e => {
   if (!keyActive() || clip.style.display === 'flex') return;
   e.preventDefault();
   if (typed.delete(e.code)) return;
-  const c = mapCode(e.code);
-  if (held.delete(c)) ksend({t: 'ku', code: c});
+  if (held.delete(e.code)) ksend({t: 'ku', code: e.code});
 });
 function releaseAll() { for (const c of held) ksend({t: 'ku', code: c}); held.clear(); typed.clear(); }
 
 // ---------- otomatik pano eşitleme (HTTPS gerektirir)
 const canClip = window.isSecureContext && navigator.clipboard;
 let lastClip = null, pendingClip = null;
-function writeLocalClip(text) {                  // Mac → Windows
+function writeLocalClip(text) {                  // uzak → yerel
   lastClip = text;
   if (!canClip) return;
   if (!document.hasFocus()) { pendingClip = text; return; }
   navigator.clipboard.writeText(text).then(() => { pendingClip = null; }, () => { pendingClip = text; });
 }
-async function pushLocalClip() {                 // Windows → Mac
+async function pushLocalClip() {                 // yerel → uzak
   if (!canClip || !document.hasFocus()) return;
   try {
     const text = await Promise.race([navigator.clipboard.readText(), new Promise((_, no) => setTimeout(no, 3000))]);
@@ -172,18 +161,17 @@ document.getElementById('fs').onclick = async () => {
   cv.focus();
 };
 document.getElementById('pin').onclick = () => document.getElementById('bar').classList.toggle('pin');
-ctrlCmd.onchange = () => { releaseAll(); try { localStorage.setItem('ctrlcmd', ctrlCmd.checked ? '1' : '0'); } catch (e) {} cv.focus(); };
 quality.onchange = () => { sendCfg(); try { localStorage.setItem('quality', quality.value); } catch (e) {} cv.focus(); };
 
 // ---------- pano
 document.getElementById('clipbtn').onclick = () => { releaseAll(); clip.style.display = 'flex'; clipText.focus(); };
 document.getElementById('clipClose').onclick = () => { clip.style.display = 'none'; cv.focus(); };
-document.getElementById('toMac').onclick = async () => {
+document.getElementById('toRemote').onclick = async () => {
   await fetch('/clipboard', {method: 'POST', body: clipText.value});
   clip.style.display = 'none'; cv.focus();
 };
-document.getElementById('typeMac').onclick = () => { send({t: 'tx', s: clipText.value}); clip.style.display = 'none'; cv.focus(); };
-document.getElementById('fromMac').onclick = async () => {
+document.getElementById('typeRemote').onclick = () => { send({t: 'tx', s: clipText.value}); clip.style.display = 'none'; cv.focus(); };
+document.getElementById('fromRemote').onclick = async () => {
   clipText.value = await fetch('/clipboard').then(r => r.text());
   clipText.select();
   try { document.execCommand('copy'); } catch (e) {}

@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
-"""MiniRDP - aynı ağdaki bir tarayıcıdan bu Mac'i görüntüleyip kontrol etmek için mini uzak masaüstü sunucusu."""
+"""MiniRDP - aynı ağdaki bir tarayıcıdan bu Windows bilgisayarı görüntüleyip kontrol etmek için mini uzak masaüstü sunucusu."""
 import asyncio
-import ctypes
-import ctypes.util
 import hashlib
 import hmac
 import io
 import ipaddress
 import json
 import logging
-import os
+import logging.handlers
 import secrets
 import ssl
-import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import win32  # noqa: I001  - DPI farkındalığı mss'ten önce ayarlanmalı
 import mss
-import Quartz as Q
-from AppKit import NSPasteboard, NSPasteboardTypeString
 from aiohttp import WSMsgType, web
 from PIL import Image
 
@@ -32,8 +29,18 @@ SCHEME = "https" if TLS else "http"
 COOKIE = "minirdp_session"
 SESSION_TTL = 7 * 24 * 3600
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("minirdp")
+
+
+def setup_logging():
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handlers = [logging.handlers.RotatingFileHandler(BASE / "minirdp.log", maxBytes=1 << 20, backupCount=2, encoding="utf-8")]
+    if sys.stderr:  # pythonw.exe ile çalışırken konsol yoktur
+        handlers.append(logging.StreamHandler())
+    for h in handlers:
+        h.setFormatter(fmt)
+        logging.root.addHandler(h)
+    logging.root.setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------- yapılandırma / şifre
@@ -41,7 +48,7 @@ log = logging.getLogger("minirdp")
 def load_config():
     cfg = {"host": "0.0.0.0", "port": 8765, "quality": 60, "max_width": 1600}
     if CONFIG_PATH.exists():
-        cfg.update(json.loads(CONFIG_PATH.read_text()))
+        cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
     return cfg
 
 
@@ -69,7 +76,7 @@ def _pw_tag():
 
 def load_sessions():
     try:
-        data = json.loads(SESSIONS_PATH.read_text())
+        data = json.loads(SESSIONS_PATH.read_text(encoding="utf-8"))
         if data.get("pw") != _pw_tag():
             return {}
         now = time.time()
@@ -79,8 +86,7 @@ def load_sessions():
 
 
 def save_sessions():
-    SESSIONS_PATH.write_text(json.dumps({"pw": _pw_tag(), "sessions": SESSIONS}))
-    SESSIONS_PATH.chmod(0o600)
+    SESSIONS_PATH.write_text(json.dumps({"pw": _pw_tag(), "sessions": SESSIONS}), encoding="utf-8")
 
 
 SESSIONS = load_sessions()  # token -> son kullanma zamanı
@@ -95,21 +101,20 @@ def valid_session(request):
 
 # ---------------------------------------------------------------- ekran yakalama
 
-_executor = ThreadPoolExecutor(max_workers=1)
+_executor = ThreadPoolExecutor(max_workers=1)  # mss nesnesi iş parçacığına bağlı; hep aynı iş parçacığı kullanılır
 _tls = {}
 
 
 def _grab_raw():
-    b = Q.CGDisplayBounds(Q.CGMainDisplayID())
-    dims = (b.size.width, b.size.height)
+    w, h = win32.primary_size()
+    if _tls.get("dims") != (w, h):
+        if "dims" in _tls:
+            log.info("Ekran boyutu değişti: %sx%s", w, h)
+        _tls["dims"] = (w, h)
     sct = _tls.get("sct")
-    if sct is None or _tls.get("dims") != dims:
-        if sct is not None:
-            sct.close()
-            log.info("Ekran boyutu değişti: %sx%s", *dims)
+    if sct is None:
         sct = _tls["sct"] = mss.MSS() if hasattr(mss, "MSS") else mss.mss()
-        _tls["dims"] = dims
-    shot = sct.grab(sct.monitors[1])
+    shot = sct.grab({"left": 0, "top": 0, "width": w, "height": h})
     return shot.size, shot.bgra
 
 
@@ -132,224 +137,9 @@ def capture(last_hash, quality, max_width):
     return h, _encode(size, raw, quality, max_width)
 
 
-def apply_resolution():
-    """config.json'daki "resolution" ([genişlik, yükseklik]) farklıysa ekranı o moda alır."""
-    want = CFG.get("resolution")
-    if not want:
-        return
-    d = Q.CGMainDisplayID()
-    cur = Q.CGDisplayCopyDisplayMode(d)
-    if (Q.CGDisplayModeGetWidth(cur), Q.CGDisplayModeGetHeight(cur)) == tuple(want):
-        return
-    for m in Q.CGDisplayCopyAllDisplayModes(d, None) or []:
-        if (Q.CGDisplayModeGetWidth(m), Q.CGDisplayModeGetHeight(m)) == tuple(want):
-            err = Q.CGDisplaySetDisplayMode(d, m, None)
-            log.info("Çözünürlük %sx%s yapıldı (hata kodu %s)", *want, err)
-            return
-    log.warning("Çözünürlük %sx%s bu ekranda yok", *want)
-
-
 # ---------------------------------------------------------------- giriş olayları (fare / klavye)
 
-KEYCODES = {
-    "KeyA": 0, "KeyS": 1, "KeyD": 2, "KeyF": 3, "KeyH": 4, "KeyG": 5, "KeyZ": 6, "KeyX": 7,
-    "KeyC": 8, "KeyV": 9, "IntlBackslash": 10, "KeyB": 11, "KeyQ": 12, "KeyW": 13, "KeyE": 14,
-    "KeyR": 15, "KeyY": 16, "KeyT": 17, "Digit1": 18, "Digit2": 19, "Digit3": 20, "Digit4": 21,
-    "Digit6": 22, "Digit5": 23, "Equal": 24, "Digit9": 25, "Digit7": 26, "Minus": 27,
-    "Digit8": 28, "Digit0": 29, "BracketRight": 30, "KeyO": 31, "KeyU": 32, "BracketLeft": 33,
-    "KeyI": 34, "KeyP": 35, "Enter": 36, "KeyL": 37, "KeyJ": 38, "Quote": 39, "KeyK": 40,
-    "Semicolon": 41, "Backslash": 42, "Comma": 43, "Slash": 44, "KeyN": 45, "KeyM": 46,
-    "Period": 47, "Tab": 48, "Space": 49, "Backquote": 50, "Backspace": 51, "Escape": 53,
-    "MetaRight": 54, "MetaLeft": 55, "ShiftLeft": 56, "CapsLock": 57, "AltLeft": 58,
-    "ControlLeft": 59, "ShiftRight": 60, "AltRight": 61, "ControlRight": 62,
-    "NumpadDecimal": 65, "NumpadMultiply": 67, "NumpadAdd": 69, "NumLock": 71,
-    "NumpadDivide": 75, "NumpadEnter": 76, "NumpadSubtract": 78, "NumpadEqual": 81,
-    "Numpad0": 82, "Numpad1": 83, "Numpad2": 84, "Numpad3": 85, "Numpad4": 86, "Numpad5": 87,
-    "Numpad6": 88, "Numpad7": 89, "Numpad8": 91, "Numpad9": 92,
-    "F1": 122, "F2": 120, "F3": 99, "F4": 118, "F5": 96, "F6": 97, "F7": 98, "F8": 100,
-    "F9": 101, "F10": 109, "F11": 103, "F12": 111, "Insert": 114, "Home": 115, "PageUp": 116,
-    "Delete": 117, "End": 119, "PageDown": 121, "ArrowLeft": 123, "ArrowRight": 124,
-    "ArrowDown": 125, "ArrowUp": 126,
-}
-
-MODIFIER_FLAGS = {
-    "ShiftLeft": Q.kCGEventFlagMaskShift, "ShiftRight": Q.kCGEventFlagMaskShift,
-    "ControlLeft": Q.kCGEventFlagMaskControl, "ControlRight": Q.kCGEventFlagMaskControl,
-    "AltLeft": Q.kCGEventFlagMaskAlternate, "AltRight": Q.kCGEventFlagMaskAlternate,
-    "MetaLeft": Q.kCGEventFlagMaskCommand, "MetaRight": Q.kCGEventFlagMaskCommand,
-}
-
-MOUSE = {  # js button -> (down, up, dragged, quartz button)
-    0: (Q.kCGEventLeftMouseDown, Q.kCGEventLeftMouseUp, Q.kCGEventLeftMouseDragged, Q.kCGMouseButtonLeft),
-    2: (Q.kCGEventRightMouseDown, Q.kCGEventRightMouseUp, Q.kCGEventRightMouseDragged, Q.kCGMouseButtonRight),
-    1: (Q.kCGEventOtherMouseDown, Q.kCGEventOtherMouseUp, Q.kCGEventOtherMouseDragged, Q.kCGMouseButtonCenter),
-}
-
-
-class LayoutMap:
-    """Karakter -> (tuş kodu, Shift/Option) eşlemesi; Mac'in o anki klavye düzeninden çıkarılır.
-
-    Bazı uygulamalar (ör. iOS Simülatörü) olaydaki Unicode metni değil tuş kodunu okur,
-    bu yüzden karakterler doğru tuş koduyla gönderilmelidir.
-    """
-
-    SHIFT, OPTION = 2, 8  # UCKeyTranslate modifierKeyState >> 8
-
-    def __init__(self):
-        self._carbon = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Carbon.framework/Carbon")
-        self._cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
-        c, cf = self._carbon, self._cf
-        c.TISCopyCurrentKeyboardLayoutInputSource.restype = ctypes.c_void_p
-        c.TISGetInputSourceProperty.restype = ctypes.c_void_p
-        c.TISGetInputSourceProperty.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        c.LMGetKbdType.restype = ctypes.c_uint8
-        c.UCKeyTranslate.argtypes = [
-            ctypes.c_void_p, ctypes.c_uint16, ctypes.c_uint16, ctypes.c_uint32, ctypes.c_uint32,
-            ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.c_ulong,
-            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_uint16),
-        ]
-        cf.CFDataGetBytePtr.restype = ctypes.c_void_p
-        cf.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
-        cf.CFRelease.argtypes = [ctypes.c_void_p]
-        self._key = ctypes.c_void_p.in_dll(c, "kTISPropertyUnicodeKeyLayoutData")
-        self._map = {}
-        self._built = 0.0
-
-    def _build(self):
-        c, cf = self._carbon, self._cf
-        src = c.TISCopyCurrentKeyboardLayoutInputSource()
-        try:
-            data = c.TISGetInputSourceProperty(src, self._key)
-            if not data:
-                return {}
-            layout = cf.CFDataGetBytePtr(data)
-            kbd = c.LMGetKbdType()
-            m = {}
-            for mods in (0, self.SHIFT, self.OPTION, self.SHIFT | self.OPTION):
-                for kc in range(128):
-                    dead, n, buf = ctypes.c_uint32(0), ctypes.c_ulong(0), (ctypes.c_uint16 * 4)()
-                    # 1 = kUCKeyTranslateNoDeadKeysBit
-                    c.UCKeyTranslate(layout, kc, 0, mods, kbd, 1, ctypes.byref(dead), 4, ctypes.byref(n), buf)
-                    if n.value == 1:
-                        ch = chr(buf[0])
-                        if ch.isprintable() and ch not in m:
-                            m[ch] = (kc, mods)
-            return m
-        finally:
-            cf.CFRelease(src)
-
-    def lookup(self, ch):
-        if time.time() - self._built > 10:  # klavye düzeni değişmiş olabilir
-            try:
-                self._map = self._build()
-            except Exception:
-                log.exception("Klavye düzeni okunamadı")
-            self._built = time.time()
-        return self._map.get(ch)
-
-
-class InputController:
-    def __init__(self):
-        self.src = Q.CGEventSourceCreate(Q.kCGEventSourceStateHIDSystemState)
-        self.layout = LayoutMap()
-        self.mods = set()
-        self.buttons = set()
-        self.click = {"t": 0.0, "b": None, "pos": (0, 0), "n": 0}
-
-    def _flags(self):
-        f = 0
-        for code in self.mods:
-            f |= MODIFIER_FLAGS[code]
-        return f
-
-    def _point(self, x, y):
-        b = Q.CGDisplayBounds(Q.CGMainDisplayID())
-        x = min(max(float(x), 0.0), 1.0)
-        y = min(max(float(y), 0.0), 1.0)
-        return (b.origin.x + x * (b.size.width - 1), b.origin.y + y * (b.size.height - 1))
-
-    def _post(self, ev, flags=True):
-        if flags:
-            Q.CGEventSetFlags(ev, self._flags())
-        Q.CGEventPost(Q.kCGHIDEventTap, ev)
-
-    def mouse_move(self, x, y):
-        p = self._point(x, y)
-        if self.buttons:
-            b = min(self.buttons)
-            kind, btn = MOUSE[b][2], MOUSE[b][3]
-        else:
-            kind, btn = Q.kCGEventMouseMoved, Q.kCGMouseButtonLeft
-        self._post(Q.CGEventCreateMouseEvent(self.src, kind, p, btn))
-
-    def mouse_button(self, b, down, x, y):
-        if b not in MOUSE:
-            return
-        p = self._point(x, y)
-        if down:
-            c = self.click
-            now = time.time()
-            near = abs(p[0] - c["pos"][0]) < 5 and abs(p[1] - c["pos"][1]) < 5
-            c["n"] = c["n"] + 1 if (c["b"] == b and near and now - c["t"] < 0.45) else 1
-            c.update(t=now, b=b, pos=p)
-            self.buttons.add(b)
-        else:
-            self.buttons.discard(b)
-        kind = MOUSE[b][0] if down else MOUSE[b][1]
-        ev = Q.CGEventCreateMouseEvent(self.src, kind, p, MOUSE[b][3])
-        Q.CGEventSetIntegerValueField(ev, Q.kCGMouseEventClickState, self.click["n"])
-        self._post(ev)
-
-    def wheel(self, dx, dy):
-        dy = int(max(min(-float(dy), 2000), -2000))
-        dx = int(max(min(-float(dx), 2000), -2000))
-        ev = Q.CGEventCreateScrollWheelEvent(self.src, Q.kCGScrollEventUnitPixel, 2, dy, dx)
-        self._post(ev)
-
-    def key(self, code, down):
-        kc = KEYCODES.get(code)
-        if kc is None:
-            return
-        if code in MODIFIER_FLAGS:
-            (self.mods.add if down else self.mods.discard)(code)
-        self._post(Q.CGEventCreateKeyboardEvent(self.src, kc, down))
-
-    def type_text(self, s):
-        s = str(s)[:2000]
-        for ch in s:
-            if ch == "\n":
-                ch = "\r"
-            n = len(ch.encode("utf-16-le")) // 2
-            hit = self.layout.lookup(ch)
-            kc, flags = 0, 0
-            if hit:
-                kc, mods = hit
-                if mods & LayoutMap.SHIFT:
-                    flags |= Q.kCGEventFlagMaskShift
-                if mods & LayoutMap.OPTION:
-                    flags |= Q.kCGEventFlagMaskAlternate
-            elif ch == "\r":
-                kc = KEYCODES["Enter"]
-            elif ch == "\t":
-                kc = KEYCODES["Tab"]
-            for down in (True, False):
-                # Hem doğru tuş kodu (Simülatör vb. için) hem de Unicode metin (diğer uygulamalar için).
-                ev = Q.CGEventCreateKeyboardEvent(self.src, kc, down)
-                Q.CGEventKeyboardSetUnicodeString(ev, n, ch)
-                Q.CGEventSetFlags(ev, flags)
-                Q.CGEventPost(Q.kCGHIDEventTap, ev)
-
-    def release_all(self):
-        for code in list(self.mods):
-            self.key(code, False)
-        for b in list(self.buttons):
-            loc = Q.CGEventGetLocation(Q.CGEventCreate(None))
-            b_info = MOUSE[b]
-            self._post(Q.CGEventCreateMouseEvent(self.src, b_info[1], loc, b_info[3]))
-        self.buttons.clear()
-
-
-INPUT = InputController()
+INPUT = win32.InputController()
 
 
 def handle_input(m):
@@ -459,7 +249,7 @@ async def logout(request):
 
 
 async def ca_cert(request):
-    # Windows'a kurulacak yerel CA sertifikası (gizli değil; özel anahtar Mac'te kalır).
+    # İstemciye kurulacak yerel CA sertifikası (gizli değil; özel anahtar bu bilgisayarda kalır).
     return web.FileResponse(CERTS / "minirdp-ca.crt", headers={
         "Content-Type": "application/x-x509-ca-cert",
         "Content-Disposition": 'attachment; filename="minirdp-ca.crt"',
@@ -469,30 +259,16 @@ async def ca_cert(request):
 CLIP_MAX = 256 * 1024  # karakter
 
 
-def clip_count():
-    return NSPasteboard.generalPasteboard().changeCount()
-
-
-def clip_read():
-    return NSPasteboard.generalPasteboard().stringForType_(NSPasteboardTypeString) or ""
-
-
-def clip_write(text):
-    pb = NSPasteboard.generalPasteboard()
-    pb.clearContents()
-    pb.setString_forType_(text, NSPasteboardTypeString)
-
-
 async def clipboard_get(request):
     if not valid_session(request):
         raise web.HTTPUnauthorized()
-    return web.Response(text=clip_read())
+    return web.Response(text=win32.clip_read())
 
 
 async def clipboard_set(request):
     if not valid_session(request):
         raise web.HTTPUnauthorized()
-    clip_write((await request.text())[:CLIP_MAX])
+    win32.clip_write((await request.text())[:CLIP_MAX])
     return web.Response(text="ok")
 
 
@@ -502,10 +278,11 @@ async def ws_handler(request):
     ws = web.WebSocketResponse(max_msg_size=1 << 20, heartbeat=20)
     await ws.prepare(request)
     log.info("Bağlantı açıldı: %s", request.remote)
-    try:
-        apply_resolution()
-    except Exception:
-        log.exception("Çözünürlük ayarlanamadı")
+    if CFG.get("resolution"):
+        try:
+            win32.apply_resolution(CFG["resolution"])
+        except Exception:
+            log.exception("Çözünürlük ayarlanamadı")
 
     state = {"credits": 2, "quality": CFG["quality"], "max_width": CFG["max_width"], "force": True}
     wake = asyncio.Event()
@@ -513,7 +290,7 @@ async def ws_handler(request):
     loop = asyncio.get_running_loop()
 
     async def sender():
-        last = None
+        last, failing = None, False
         while not ws.closed:
             await wake.wait()
             if state["credits"] <= 0:
@@ -521,7 +298,16 @@ async def ws_handler(request):
                 continue
             if state["force"]:
                 last, state["force"] = None, False
-            res = await loop.run_in_executor(_executor, capture, last, state["quality"], state["max_width"])
+            try:
+                res = await loop.run_in_executor(_executor, capture, last, state["quality"], state["max_width"])
+                failing = False
+            except Exception:
+                # Kilit ekranı / UAC gibi güvenli masaüstündeyken ekran yakalanamaz; geri dönünce devam edilir.
+                if not failing:
+                    log.exception("Ekran yakalanamadı")
+                failing = True
+                await asyncio.sleep(1)
+                continue
             if res is None:
                 await asyncio.sleep(0.04)
                 continue
@@ -533,22 +319,23 @@ async def ws_handler(request):
                 break
 
     async def clip_watcher():
-        # Mac panosu değişince metni istemciye gönder (Mac → Windows).
-        count = clip_count()
+        # Bu bilgisayarın panosu değişince metni istemciye gönder (uzak → yerel).
+        count = win32.clip_count()
         while not ws.closed:
             await asyncio.sleep(0.4)
-            c = clip_count()
+            c = win32.clip_count()
             if c == count:
                 continue
             count = c
-            text = clip_read()
+            text = win32.clip_read()
             if text and text != state["clip"] and len(text) <= CLIP_MAX:
                 state["clip"] = text
                 await ws.send_str(json.dumps({"t": "clip", "s": text}))
 
-    state["clip"] = clip_read()
+    state["clip"] = win32.clip_read()
     task = asyncio.create_task(sender())
     clip_task = asyncio.create_task(clip_watcher())
+    blocked = False
     try:
         async for msg in ws:
             if msg.type != WSMsgType.TEXT:
@@ -564,14 +351,19 @@ async def ws_handler(request):
                 state["force"] = True
                 wake.set()
             elif t == "clip":
-                # Windows → Mac. Aynı metni geri göndermemek için state["clip"]'e yazılır.
+                # Yerel → uzak. Aynı metni geri göndermemek için state["clip"]'e yazılır.
                 text = str(m.get("s", ""))[:CLIP_MAX]
                 if text and text != state["clip"]:
                     state["clip"] = text
-                    clip_write(text)
+                    win32.clip_write(text)
             else:
                 try:
                     handle_input(m)
+                    blocked = False
+                except OSError:
+                    if not blocked:
+                        log.warning("Giriş olayı engellendi (yönetici penceresi veya güvenli masaüstü olabilir)")
+                    blocked = True
                 except Exception:
                     log.exception("Giriş olayı işlenemedi: %s", m)
     finally:
@@ -582,28 +374,13 @@ async def ws_handler(request):
     return ws
 
 
-def check_permissions():
-    try:
-        if not Q.CGPreflightScreenCaptureAccess():
-            log.warning("Ekran kaydı izni YOK - Sistem Ayarları > Gizlilik > Ekran Kaydı'ndan MiniRDP'ye izin verin.")
-            Q.CGRequestScreenCaptureAccess()
-        from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt
-        if not AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True}):
-            log.warning("Erişilebilirlik izni YOK - Sistem Ayarları > Gizlilik > Erişilebilirlik'ten MiniRDP'ye izin verin.")
-    except Exception:
-        log.exception("İzin kontrolü yapılamadı")
-
-
-def keep_awake():
-    # Bu süreç çalıştığı sürece Mac'in uykuya geçmesini ve ekranın kapanmasını engeller.
-    subprocess.Popen(["caffeinate", "-dis", "-w", str(os.getpid())])
-
-
 def main():
+    setup_logging()
     if "password_hash" not in CFG:
-        raise SystemExit("Şifre ayarlanmamış. Önce: ./venv/bin/python set_password.py")
-    check_permissions()
-    keep_awake()
+        raise SystemExit("Şifre ayarlanmamış. Önce: venv\\Scripts\\python set_password.py")
+    if not win32.is_admin():
+        log.warning("Yönetici olarak çalışmıyor - yönetici yetkisiyle açılmış pencerelerde fare/klavye çalışmaz.")
+    win32.keep_awake()
     app = web.Application(middlewares=[security], client_max_size=1 << 20)
     app.on_response_prepare.append(security_headers)
     app.add_routes([
