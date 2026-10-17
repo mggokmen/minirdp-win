@@ -1,5 +1,6 @@
 ﻿# MiniRDP kurulumu: Python ortamı, şifre, sertifikalar, güvenlik duvarı kuralı ve oturum açılınca otomatik başlatma.
-# Kullanım (PowerShell):  powershell -ExecutionPolicy Bypass -File .\install.ps1
+# Kullanım (PowerShell):  powershell -ExecutionPolicy Bypass -File .\install.ps1 [-Python C:\yol\python.exe]
+param([string]$Python)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 $Dir = $PSScriptRoot
@@ -8,22 +9,27 @@ $Dir = $PSScriptRoot
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $admin) {
     Write-Host "Yönetici yetkisi isteniyor..."
-    Start-Process powershell -Verb RunAs -ArgumentList "-NoExit -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    Start-Process powershell -Verb RunAs -ArgumentList "-NoExit -ExecutionPolicy Bypass -File `"$PSCommandPath`"" + $(if ($Python) { " -Python `"$Python`"" })
     exit
 }
 
 Write-Host "== Python ortamı"
 $py = $null
-# Python Install Manager da Store yönlendiricisi de WindowsApps altındadır; ayırt etmek için sürümü sorulur
-# (yönlendirici sürüm yazmaz).
-# Girdi $null'dan verilir: Install Manager'ın ilk çalıştırma soruları görünmeden beklemesin.
-foreach ($c in 'py', 'python') {
+# Sırayla: -Python ile verilen, Python Install Manager'ın / klasik yükleyicinin kurduğu (en yeni sürüm önce),
+# PATH'teki py / python. Girdi $null'dan verilir: ilk çalıştırma soruları görünmeden beklemesin.
+# Microsoft Store yönlendiricisi (WindowsApps\python.exe) hiçbir şey yazmadığı için kendiliğinden elenir.
+$candidates = @()
+if ($Python) { $candidates += $Python }
+$candidates += Get-ChildItem "$env:LOCALAPPDATA\Python\pythoncore-3.*\python.exe", "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe" -ErrorAction SilentlyContinue |
+    Sort-Object { [int]($_.Directory.Name -replace '^\D*3\.?(\d+).*$', '$1') } -Descending | ForEach-Object FullName
+$candidates += 'py', 'python'
+foreach ($c in $candidates) {
     if (-not (Get-Command $c -ErrorAction SilentlyContinue)) { continue }
     Write-Host "   '$c' deneniyor..."
-    $out = $null | & $c -c "import sys; print('%d.%d|%s' % (*sys.version_info[:2], sys.executable))" 2>$null | Select-Object -Last 1
-    if ($out -match '^(\d+\.\d+)\|(.+)$' -and [version]$Matches[1] -ge [version]'3.11') { $py = $Matches[2]; break }
+    $out = $null | & $c -c "import sys;sys.version_info>=(3,11) and print(sys.executable)" 2>$null | Select-Object -Last 1
+    if ($out -and (Test-Path $out)) { $py = $out; break }
 }
-if (-not $py) { throw "Python 3.11+ bulunamadı. python.org'dan Python Install Manager ile kurup 'py install 3.15' çalıştırın." }
+if (-not $py) { throw "Python 3.11+ bulunamadı. python.org'dan Python Install Manager ile kurup 'py install 3.15' çalıştırın ya da yolu verin: .\install.ps1 -Python C:\yol\python.exe" }
 Write-Host "   Python: $py"
 if (-not (Test-Path venv\Scripts\python.exe)) {
     Write-Host "   Sanal ortam oluşturuluyor..."
