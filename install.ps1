@@ -16,16 +16,23 @@ Write-Host "== Python ortamı"
 $py = $null
 # Python Install Manager da Store yönlendiricisi de WindowsApps altındadır; ayırt etmek için sürümü sorulur
 # (yönlendirici sürüm yazmaz).
-foreach ($c in @(@('py'), @('python'))) {
-    if (-not (Get-Command $c[0] -ErrorAction SilentlyContinue)) { continue }
-    $ver = & $c[0] -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null | Select-Object -Last 1
-    if ($ver -match '^\d+\.\d+$' -and [version]$ver -ge [version]'3.11') { $py = $c; break }
+# Girdi $null'dan verilir: Install Manager'ın ilk çalıştırma soruları görünmeden beklemesin.
+foreach ($c in 'py', 'python') {
+    if (-not (Get-Command $c -ErrorAction SilentlyContinue)) { continue }
+    Write-Host "   '$c' deneniyor..."
+    $out = $null | & $c -c "import sys; print('%d.%d|%s' % (*sys.version_info[:2], sys.executable))" 2>$null | Select-Object -Last 1
+    if ($out -match '^(\d+\.\d+)\|(.+)$' -and [version]$Matches[1] -ge [version]'3.11') { $py = $Matches[2]; break }
 }
-if (-not $py) { throw "Python 3.11+ bulunamadı. python.org'dan Python Install Manager ile kurun." }
-if (-not (Test-Path venv)) { & $py[0] $py[1..9] -m venv venv }
+if (-not $py) { throw "Python 3.11+ bulunamadı. python.org'dan Python Install Manager ile kurup 'py install 3.15' çalıştırın." }
+Write-Host "   Python: $py"
+if (-not (Test-Path venv\Scripts\python.exe)) {
+    Write-Host "   Sanal ortam oluşturuluyor..."
+    & $py -m venv venv
+    if ($LASTEXITCODE) { throw "Sanal ortam oluşturulamadı." }
+}
 $vpy = "$Dir\venv\Scripts\python.exe"
-& $vpy -m pip install -q --upgrade pip
-& $vpy -m pip install -q -r requirements.txt
+Write-Host "   Paketler indiriliyor (bir iki dakika sürebilir)..."
+& $vpy -m pip install --disable-pip-version-check -r requirements.txt
 if ($LASTEXITCODE) { throw "Paketler kurulamadı." }
 
 Write-Host "== Yapılandırma"
