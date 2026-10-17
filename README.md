@@ -14,7 +14,7 @@ Aynı ağdaki bir bilgisayardan (Chrome/Edge) bir Windows bilgisayarı uzaktan g
 ## Gereksinimler
 
 - Windows 10/11
-- [python.org](https://www.python.org/downloads/windows/) Python 3.11+ (kurulumda "Add python.exe to PATH" işaretli). Microsoft Store sürümü önerilmez.
+- Python 3.11+ (3.15 dahil). [python.org](https://www.python.org/downloads/windows/)'daki **Python Install Manager** ile kurup `py install 3.15` diyebilir ya da klasik yükleyiciyi ("Add python.exe to PATH" işaretli) kullanabilirsiniz.
 
 ## Kurulum
 

@@ -14,13 +14,14 @@ if (-not $admin) {
 
 Write-Host "== Python ortamı"
 $py = $null
-foreach ($c in @(@('py', '-3'), @('python'))) {
-    $cmd = Get-Command $c[0] -ErrorAction SilentlyContinue
-    if (-not $cmd -or $cmd.Source -like '*\WindowsApps\*') { continue }  # Microsoft Store yönlendiricisi
-    $ver = & $c[0] $c[1..9] -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
-    if ($ver -and [version]$ver -ge [version]'3.11') { $py = $c; break }
+# Python Install Manager da Store yönlendiricisi de WindowsApps altındadır; ayırt etmek için sürümü sorulur
+# (yönlendirici sürüm yazmaz).
+foreach ($c in @(@('py'), @('python'))) {
+    if (-not (Get-Command $c[0] -ErrorAction SilentlyContinue)) { continue }
+    $ver = & $c[0] -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null | Select-Object -Last 1
+    if ($ver -match '^\d+\.\d+$' -and [version]$ver -ge [version]'3.11') { $py = $c; break }
 }
-if (-not $py) { throw "Python 3.11+ bulunamadı. python.org'dan kurun ('Add python.exe to PATH' işaretli)." }
+if (-not $py) { throw "Python 3.11+ bulunamadı. python.org'dan Python Install Manager ile kurun." }
 if (-not (Test-Path venv)) { & $py[0] $py[1..9] -m venv venv }
 $vpy = "$Dir\venv\Scripts\python.exe"
 & $vpy -m pip install -q --upgrade pip
